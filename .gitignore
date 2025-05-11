@@ -10,3 +10,8 @@ __pycache__/
 input.txt
 env/
 venv/
+
+# Checkpoints & models
+out-shakespeare-char/*.pt
+out-shakespeare-char/checkpoint_*
+ckpt_*.pt

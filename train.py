@@ -29,6 +29,20 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 
+# 以下是实验需要
+import copy
+from perturbation_manager import insert_perturbation_before_dropout, set_perturbation_mode
+from datetime import datetime
+
+# 以下是NPU需要
+import torch_npu 
+from torch_npu.contrib import transfer_to_npu
+os.environ['ASCEND_LAUNCH_BLOCKING'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
+
+# 用于保存数据
+import csv
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -71,7 +85,9 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+
+# 使用NPU实验禁用
+compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -103,13 +119,23 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
+    # 保存数据
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = os.path.join(out_dir, f"train_loss_log_{timestamp}.csv")
+    csv_file = open(csv_path, mode="w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(["iter", "train_loss_clean", "train_loss_noisy", "delta_train_loss"])
+    
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
+# ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+# NPU实验，关闭
+ctx = torch.cuda.amp.autocast(enabled=False)
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
@@ -132,7 +158,8 @@ def get_batch(split):
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
-best_val_loss = 1e9
+best_val_loss_clean = 1e9
+best_val_loss_noisy = 1e9
 
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -148,7 +175,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
-    print("Initializing a new model from scratch")
+    print("Initializing a new clean model from scratch")
     # determine the vocab size we'll use for from-scratch training
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
@@ -158,7 +185,7 @@ if init_from == 'scratch':
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(out_dir, 'ckpt_clean.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
@@ -177,7 +204,7 @@ elif init_from == 'resume':
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
+    best_val_loss_clean = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
@@ -186,46 +213,117 @@ elif init_from.startswith('gpt2'):
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
+
+    
+
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
+model_clean = model  # 当前已有的模型就是 clean
+
+# model_noisy init 逻辑和上面完全一致
+if init_from == 'scratch':
+    # init a new model from scratch
+    print("Initializing a new noisy model from scratch")
+    # determine the vocab size we'll use for from-scratch training
+    if meta_vocab_size is None:
+        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+    gptconf_noisy = GPTConfig(**model_args)
+    model_noisy = GPT(gptconf_noisy)
+elif init_from == 'resume':
+    print(f"Resuming training from {out_dir}")
+    # resume training from a checkpoint.
+    ckpt_path = os.path.join(out_dir, 'ckpt_noisy.pt')
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint_model_args = checkpoint['model_args']
+    # force these config attributes to be equal otherwise we can't even resume training
+    # the rest of the attributes (e.g. dropout) can stay as desired from command line
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+        model_args[k] = checkpoint_model_args[k]
+    # create the model
+    gptconf_noisy = GPTConfig(**model_args)
+    model_noisy = GPT(gptconf_noisy)
+    state_dict = checkpoint['model']
+    # fix the keys of the state dictionary :(
+    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model_noisy.load_state_dict(state_dict)
+    iter_num = checkpoint['iter_num']
+    best_val_loss_noisy = checkpoint['best_val_loss']
+elif init_from.startswith('gpt2'):
+    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
+    # initialize from OpenAI GPT-2 weights
+    override_args = dict(dropout=dropout)
+    model_noisy = GPT.from_pretrained(init_from, override_args)
+    # read off the created config params, so we can store them into checkpoint correctly
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+        model_args[k] = getattr(model.config, k)
+
+# crop down the model block size if desired, using model surgery
+if block_size < model_noisy.config.block_size:
+    model_noisy.crop_block_size(block_size)
+    model_args['block_size'] = block_size # so that the checkpoint will have the right value
+model_noisy.to(device)
+
+
+insert_perturbation_before_dropout(model_clean, mode="none", forward_eps=1e-3, grad_eps=1e-3)
+insert_perturbation_before_dropout(model_noisy, mode="both", forward_eps=1e-3, grad_eps=1e-3)
+
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+# 为了NPU实验，均关闭
+scaler_clean = torch.cuda.amp.GradScaler(enabled=False)
+scaler_noisy = torch.cuda.amp.GradScaler(enabled=False)
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizer_clean = model_clean.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizer_noisy = model_noisy.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
+    optimizer_clean.load_state_dict(checkpoint['optimizer_clean'])
+    optimizer_noisy.load_state_dict(checkpoint['optimizer_noisy'])
 checkpoint = None # free up memory
 
 # compile the model
 if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
+    print("compiling the clean and nosiy models ... (takes a ~minute)")
+    unoptimized_model_clean = model_clean
+    unoptimized_model_noisy = model_noisy
+    model_clean = torch.compile(model_clean) # requires PyTorch 2.0
+    model_noisy = torch.compile(model_noisy) # requires PyTorch 2.0
 
 # wrap model into DDP container
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    model_clean = DDP(model_clean, device_ids=[ddp_local_rank])
+    model_noisy = DDP(model_noisy, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
-    out = {}
-    model.eval()
+    out_clean = {}
+    out_noisy = {}
+    model_clean.eval()
+    model_noisy.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
+        losses_clean = torch.zeros(eval_iters)
+        losses_noisy = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
+                logits_clean, loss_clean = model_clean(X, Y)
+                logits_noisy, loss_noisy = model_noisy(X, Y)
+            losses_clean[k] = loss_clean.item()
+            losses_noisy[k] = loss_noisy.item()
+        out_clean[split] = loss_clean.mean()
+        out_noisy[split] = loss_noisy.mean()
+    model_clean.train()
+    model_noisy.train()
+    return out_clean, out_noisy
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -250,40 +348,70 @@ if wandb_log and master_process:
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
-running_mfu = -1.0
+raw_model_clean = model_clean.module if ddp else model_clean # unwrap DDP container if needed
+raw_model_noisy = model_noisy.module if ddp else model_noisy
+running_mfu_clean = -1.0
+running_mfu_noisy = -1.0
 while True:
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
+    for param_group in optimizer_clean.param_groups:
         param_group['lr'] = lr
+    for param_group in optimizer_noisy.param_groups:
+        param_group['lr'] = lr
+        
+    # === 设置扰动模式 ===
+    set_perturbation_mode(model_clean, "none")
+    set_perturbation_mode(model_noisy, "both")
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        losses_clean, losses_noisy = estimate_loss()
+        print(f"[Eval {iter_num}] Clean: train loss ={losses_clean['train']:.4f}, val loss ={losses_clean['val']:.4f}")
+        print(f"[Eval {iter_num}] Noisy: train loss ={losses_noisy['train']:.4f}, val loss ={losses_noisy['val']:.4f}")
+        print(f"Delta val loss: {losses_noisy['val'] - losses_clean['val']:.4f}")
+        
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
+                "train/loss_clean": losses_clean['train'],
+                "val/loss_clean": losses_clean['val'],
+                "train/loss_noisy": losses_noisy['train'],
+                "val/loss_noisy": losses_noisy['val'],
+                "delta_val_loss": losses_noisy['val'] - losses_clean['val'],
                 "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
+                "mfu_clean": running_mfu_clean*100,
+                "mfu_noisy": running_mfu_noisy*100,
             })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+            
+        # 不保存checkpoint
+        # if losses_clean['val'] < best_val_loss_clean or always_save_checkpoint:
+        #     best_val_loss_clean = losses_clean['val']
+        #     if iter_num > 0:
+        #         checkpoint_clean = {
+        #             'model': raw_model_clean.state_dict(),
+        #             'optimizer': optimizer_clean.state_dict(),
+        #             'model_args': model_args,
+        #             'iter_num': iter_num,
+        #             'best_val_loss': best_val_loss_clean,
+        #             'config': config,
+        #         }
+        #         print(f"saving clean checkpoint to {out_dir}")
+        #         torch.save(checkpoint_clean, os.path.join(out_dir, 'ckpt_clean.pt'))
+        # if losses_noisy['val'] < best_val_loss_noisy or always_save_checkpoint:
+        #     best_val_loss_noisy = losses_noisy['val']
+        #     if iter_num > 0:
+        #         checkpoint_noisy = {
+        #             'model': raw_model_noisy.state_dict(),
+        #             'optimizer': optimizer_noisy.state_dict(),
+        #             'model_args': model_args,
+        #             'iter_num': iter_num,
+        #             'best_val_loss': best_val_loss_noisy,
+        #             'config': config,
+        #         }
+        #         print(f"saving clean checkpoint to {out_dir}")
+        #         torch.save(checkpoint_noisy, os.path.join(out_dir, 'ckpt_noisy.pt'))
     if iter_num == 0 and eval_only:
         break
 
@@ -295,23 +423,40 @@ while True:
             # the official way to do this is with model.no_sync() context manager, but
             # I really dislike that this bloats the code and forces us to repeat code
             # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+            model_clean.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+            model_noisy.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            logits_clean, loss_clean = model_clean(X, Y)
+            loss_clean = loss_clean / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            
+        with ctx:
+            logits_noisy, loss_noisy = model_noisy(X, Y)
+            loss_noisy = loss_noisy / gradient_accumulation_steps
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
+        scaler_clean.scale(loss_clean).backward()
+        scaler_noisy.scale(loss_noisy).backward()
+    
     # clip the gradient
     if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler_clean.unscale_(optimizer_clean)
+        torch.nn.utils.clip_grad_norm_(model_clean.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
+    scaler_clean.step(optimizer_clean)
+    scaler_clean.update()
     # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
+    optimizer_clean.zero_grad(set_to_none=True)
+    
+    # clip the gradient
+    if grad_clip != 0.0:
+        scaler_noisy.unscale_(optimizer_noisy)
+        torch.nn.utils.clip_grad_norm_(model_noisy.parameters(), grad_clip)
+    # step the optimizer and scaler if training in fp16
+    scaler_noisy.step(optimizer_noisy)
+    scaler_noisy.update()
+    # flush the gradients as soon as we can, no need for this memory anymore
+    optimizer_noisy.zero_grad(set_to_none=True)
 
     # timing and logging
     t1 = time.time()
@@ -320,11 +465,25 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
+        lossf_clean = loss_clean.item() * gradient_accumulation_steps
+        lossf_noisy = loss_noisy.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+            mfu_clean = raw_model_clean.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            running_mfu_clean = mfu_clean if running_mfu_clean == -1.0 else 0.9*running_mfu_clean + 0.1*mfu_clean
+            mfu_noisy = raw_model_noisy.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            running_mfu_noisy = mfu_noisy if running_mfu_noisy == -1.0 else 0.9*running_mfu_noisy + 0.1*mfu_noisy
+        print(f"[iter {iter_num}] Clean: loss {lossf_clean:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu_clean*100:.2f}%")
+        print(f"[iter {iter_num}] Noisy: loss {lossf_noisy:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu_noisy*100:.2f}%")
+    
+    # 每一步都写入
+    if master_process:
+        csv_writer.writerow([
+            iter_num,
+            lossf_clean,
+            lossf_noisy,
+            lossf_noisy - lossf_clean
+        ])
+    
     iter_num += 1
     local_iter_num += 1
 
@@ -332,5 +491,8 @@ while True:
     if iter_num > max_iters:
         break
 
+if master_process:
+    csv_file.close()
+    
 if ddp:
     destroy_process_group()
