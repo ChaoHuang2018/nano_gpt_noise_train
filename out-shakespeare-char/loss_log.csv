@@ -1,3 +1,0 @@
-iter,train_loss_clean,val_loss_clean,train_loss_noisy,val_loss_noisy,delta_val_loss
-0,"tensor(4.2847, device='npu:0')","tensor(4.2842, device='npu:0')","tensor(4.2368, device='npu:0')","tensor(4.2386, device='npu:0')","tensor(-0.0456, device='npu:0')"
-250,"tensor(1.9782, device='npu:0')","tensor(2.0897, device='npu:0')","tensor(1.9734, device='npu:0')","tensor(2.0900, device='npu:0')","tensor(0.0003, device='npu:0')"

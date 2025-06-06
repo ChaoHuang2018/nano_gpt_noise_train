@@ -15,3 +15,5 @@ venv/
 out-shakespeare-char/*.pt
 out-shakespeare-char/checkpoint_*
 ckpt_*.pt
+out-shakespeare-char/both*/
+/kernel_meta*/

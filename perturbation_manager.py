@@ -21,7 +21,7 @@ class PerturbationInjector(nn.Module):
         return x
 
 # ==== 2. 注入包装器：在 Dropout 前注入扰动 ====
-def insert_perturbation_before_dropout(model, mode="none", forward_eps=1e-3, grad_eps=1e-3):
+def insert_perturbation_before_dropout(model, mode="none", forward_eps=1e-3, grad_eps=1e-3, target_types=None):
     def wrap_mlp(module):
         perturb = PerturbationInjector(mode, forward_eps, grad_eps)
         def new_forward(x):
@@ -72,6 +72,11 @@ def insert_perturbation_before_dropout(model, mode="none", forward_eps=1e-3, gra
         module.forward = new_forward
 
     for name, submodule in model.named_modules():
+        cls_name = submodule.__class__.__name__
+
+        if target_types is not None and cls_name not in target_types:
+            continue
+        
         if submodule.__class__.__name__ == "MLP":
             wrap_mlp(submodule)
         elif submodule.__class__.__name__ == "CausalSelfAttention":
