@@ -3,20 +3,21 @@ import subprocess
 import csv
 from itertools import product
 import pandas as pd
+import numpy as np
 
 # ==== 配置搜索空间 ====
 # modes = ["forward", "both"]
-modes = ["both"]
-epsilons = [1e-4, 1e-3, 1e-2, 1e-1]
+modes = ["forward", "both"]
+epsilons = np.logspace(-5, -1, num=9).tolist()
 # none表示不指定扰动层，所有层都有扰动误差
 layer_types = ["none", "MLP", "LayerNorm", "CausalSelfAttention"]
 # repeats_per_config = 1
-REPEATS = 50
+REPEATS = 20
 
 # ==== 输出文件 ====
 summary_dir = "summaries"
 os.makedirs(summary_dir, exist_ok=True)
-summary_csv_path = os.path.join(summary_dir, "summary_new.csv")
+summary_csv_path = os.path.join(summary_dir, "summary_GPU.csv")
 fail_log_path = os.path.join(summary_dir, "failed_runs.log")
 
 # ==== 读取已完成项 ====
@@ -29,25 +30,28 @@ if os.path.exists(summary_csv_path):
         
 # ==== 准备写入 summary ====
 file_exists = os.path.exists(summary_csv_path)
+file_empty = (not file_exists) or os.path.getsize(summary_csv_path) == 0
+
+headers = [
+    "config_id", "repeat_id",
+    "error_mode", "forward_eps", "grad_eps", "layer_types",
+    "final_loss"
+]
+try:
+    iter_cols = [f"loss_iter_{i}" for i in range(501)]
+    headers += iter_cols
+except Exception:
+    iter_cols = []
+
+# 只在文件不存在或为空时写表头
+if file_empty:
+    with open(summary_csv_path, "w", newline="") as summary_file:
+        summary_writer = csv.writer(summary_file)
+        summary_writer.writerow(headers)
+
+# 后续追加写入
 summary_file = open(summary_csv_path, "a", newline="")
 summary_writer = csv.writer(summary_file)
-
-if not file_exists:
-    # 基础字段
-    headers = [
-        "config_id", "repeat_id",
-        "error_mode", "forward_eps", "grad_eps", "layer_types",
-        "final_loss"
-    ]
-
-    # 尝试加载一个已有 run 的 loss_log 用于推断迭代次数
-    try:
-        iter_cols = [f"loss_iter_{i}" for i in range(501)]
-        headers += iter_cols
-    except Exception:
-        iter_cols = []
-
-    summary_writer.writerow(headers)
 
 # ==== 检查并运行 baseline（无扰动）（repeat_id = -1）====
 baseline_name = "clean_baseline"

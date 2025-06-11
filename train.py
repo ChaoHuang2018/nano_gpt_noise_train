@@ -31,7 +31,6 @@ from model import GPTConfig, GPT
 
 # 以下是实验需要
 import copy
-from perturbation_manager import insert_perturbation_before_dropout, set_perturbation_mode
 from batch_loader import SequentialBatchLoader
 from datetime import datetime
 
@@ -43,10 +42,10 @@ error_layer_types = "MLP,CausalSelfAttention,LayerNorm,none"
 run_name = "default"
 
 # 以下是NPU需要
-import torch_npu 
-from torch_npu.contrib import transfer_to_npu
-os.environ['ASCEND_LAUNCH_BLOCKING'] = '1'
-os.environ['OMP_NUM_THREADS'] = '1'
+# import torch_npu 
+# from torch_npu.contrib import transfer_to_npu
+# os.environ['ASCEND_LAUNCH_BLOCKING'] = '1'
+# os.environ['OMP_NUM_THREADS'] = '1'
 init_checkpoint_dir = "out-shakespeare-char/clean_init"
 
 # 用于保存数据
@@ -121,7 +120,8 @@ if ddp:
 else:
     # if not ddp, we are running on a single gpu, and one process
     master_process = True
-    seed_offset = 0
+    # seed_offset = 0
+    seed_offset = int(time.time()) % (2**16)
     ddp_world_size = 1
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
@@ -272,14 +272,38 @@ model_noisy.to(device)
 
 
 # 加入扰动
-insert_perturbation_before_dropout(
-    model_noisy,
-    mode=config["error_mode"],
-    forward_eps=config["forward_eps"],
-    grad_eps=config["grad_eps"],
-    target_types=config["error_layer_types"].split(",")
-)
+from perturbation_manager import PerturbationInjector
 
+target_types = error_layer_types.split(",")  # 例如 ["MLP", "LayerNorm"]
+apply_all = "none" in target_types
+
+for i, block in enumerate(model_noisy.transformer.h):
+
+    if apply_all or "MLP" in target_types:
+        block.mlp.perturb = PerturbationInjector(
+            mode=error_mode,
+            forward_eps=forward_eps,
+            grad_eps=grad_eps,
+            name=f"mlp_{i}"
+        )
+
+    if apply_all or "CausalSelfAttention" in target_types:
+        block.attn.perturb = PerturbationInjector(
+            mode=error_mode,
+            forward_eps=forward_eps,
+            grad_eps=grad_eps,
+            name=f"attn_{i}"
+        )
+
+    if apply_all or "LayerNorm" in target_types:
+        for ln_name in ["ln_1", "ln_2"]:
+            if hasattr(block, ln_name):
+                getattr(block, ln_name).perturb = PerturbationInjector(
+                    mode=error_mode,
+                    forward_eps=forward_eps,
+                    grad_eps=grad_eps,
+                    name=f"{ln_name}_{i}"
+                )
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 # 为了NPU实验，均关闭
@@ -343,15 +367,13 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model_noisy = model_noisy.module if ddp else model_noisy
 train_loss_log = []
 running_mfu_noisy = -1.0
+
 while True:
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer_noisy.param_groups:
         param_group['lr'] = lr
-        
-    # === 设置扰动模式 ===
-    set_perturbation_mode(model_noisy, config["error_mode"])
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -424,6 +446,14 @@ while True:
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer_noisy.zero_grad(set_to_none=True)
 
+    # 每一步都写入
+    if master_process:
+        current_lossf_noisy = loss_noisy.item() * gradient_accumulation_steps
+        train_loss_log.append({
+            "iter": iter_num,
+            "train_loss": current_lossf_noisy
+        })
+
     # timing and logging
     if iter_num % log_interval == 0 and master_process:
         t1 = time.time()
@@ -437,12 +467,6 @@ while True:
             running_mfu_noisy = mfu_noisy if running_mfu_noisy == -1.0 else 0.9*running_mfu_noisy + 0.1*mfu_noisy
         print(f"[iter {iter_num}] Noisy: loss {lossf_noisy:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu_noisy*100:.2f}%")
     
-    # 每一步都写入
-    if master_process:
-        train_loss_log.append({
-            "iter": iter_num,
-            "train_loss": lossf_noisy
-        })
     
     iter_num += 1
     local_iter_num += 1
