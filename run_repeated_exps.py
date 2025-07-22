@@ -5,10 +5,13 @@ from itertools import product
 import pandas as pd
 import numpy as np
 
+def normalize_eps(eps_val, decimals=8):
+    return round(float(eps_val), decimals)
+
 # ==== 配置搜索空间 ====
 # modes = ["forward", "both"]
 modes = ["forward", "both"]
-epsilons = np.logspace(-5, -1, num=9).tolist()
+epsilons = np.logspace(-7, -2, num=11).tolist()
 # none表示不指定扰动层，所有层都有扰动误差
 layer_types = ["none", "MLP", "LayerNorm", "CausalSelfAttention"]
 # repeats_per_config = 1
@@ -17,7 +20,7 @@ REPEATS = 20
 # ==== 输出文件 ====
 summary_dir = "summaries"
 os.makedirs(summary_dir, exist_ok=True)
-summary_csv_path = os.path.join(summary_dir, "summary_GPU.csv")
+summary_csv_path = os.path.join(summary_dir, "summary_NPU.csv")
 fail_log_path = os.path.join(summary_dir, "failed_runs.log")
 
 # ==== 读取已完成项 ====
@@ -26,14 +29,21 @@ if os.path.exists(summary_csv_path):
     print(f"Loading existing summary from {summary_csv_path}")
     df_existing = pd.read_csv(summary_csv_path)
     for _, row in df_existing.iterrows():
-        completed_runs.add((int(row["config_id"]), int(row["repeat_id"])))
+        key = (
+            int(row["repeat_id"]),
+            row["error_mode"],
+            normalize_eps(row["forward_eps"]),
+            normalize_eps(row["grad_eps"]),
+            str(row["layer_types"])
+        )
+        completed_runs.add(key)
         
 # ==== 准备写入 summary ====
 file_exists = os.path.exists(summary_csv_path)
 file_empty = (not file_exists) or os.path.getsize(summary_csv_path) == 0
 
 headers = [
-    "config_id", "repeat_id",
+    "repeat_id",
     "error_mode", "forward_eps", "grad_eps", "layer_types",
     "final_loss"
 ]
@@ -65,7 +75,11 @@ loss_values = []
 baseline_recorded = False
 if os.path.exists(summary_csv_path):
     df_existing = pd.read_csv(summary_csv_path)
-    if -1 in df_existing["config_id"].values:
+    baseline_key = (
+            0, "none", normalize_eps(0.0), normalize_eps(0.0), str([])
+        )
+
+    if baseline_key in completed_runs:
         print("✅ Baseline already exists in summary.")
         baseline_recorded = True
 
@@ -98,22 +112,29 @@ if not baseline_recorded:
     with open(summary_csv_path, "a", newline="") as fsum:
         writer = csv.writer(fsum)
         writer.writerow([
-            -1, 0,
+            0,
             "none", 0.0, 0.0, [], final_loss,
             *loss_values
         ])
     print(f"✅ Baseline training complete. Final loss: {final_loss:.4f}")
 
 # ==== 遍历配置并训练 ====
-config_id = 0
 for mode, eps, layers in product(modes, epsilons, layer_types):
     
     layer_str = layers  # e.g., "MLP"
-    print(f"\n[Config {config_id}] mode={mode}, eps={eps}, layers={layer_str}")
+    print(f"\n[Config: mode={mode}, eps={eps}, layers={layer_str}]")
 
     for repeat_id in range(REPEATS):
-        if (config_id, repeat_id) in completed_runs:
-            print(f"  Skipping repeat {repeat_id} (already completed)")
+        run_key = (
+            repeat_id,
+            mode,
+            normalize_eps(eps),
+            normalize_eps(eps),
+            str(layer_str)
+        )
+        
+        if run_key in completed_runs:
+            print(f"  Skipping: repeat={repeat_id}, mode={mode}, eps={eps}, layer={layer_str}")
             continue
 
         run_name = f"{mode}_{eps}_{layer_str}_rep{repeat_id}".replace(".", "")
@@ -154,7 +175,7 @@ for mode, eps, layers in product(modes, epsilons, layer_types):
 
             # === 写入 summary ===
             summary_writer.writerow([
-                config_id, repeat_id,
+                repeat_id,
                 mode, eps, eps, layer_str, final_loss,
                 *loss_values
             ])
@@ -164,8 +185,6 @@ for mode, eps, layers in product(modes, epsilons, layer_types):
             print(f"  ❌ Run failed: Config {config_id}, Repeat {repeat_id}")
             with open(fail_log_path, "a") as ferr:
                 ferr.write(f"{config_id},{repeat_id},{mode},{eps},{layer_str}: {e}\n")
-
-    config_id += 1
 
 summary_file.close()
 print("\n✅ All experiments completed or skipped as needed.")

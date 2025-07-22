@@ -17,4 +17,5 @@ out-shakespeare-char/checkpoint_*
 ckpt_*.pt
 out-shakespeare-char/both*/
 out-shakespeare-char/forward*/
+out-shakespeare-char/blocktest*/
 /kernel_meta*/

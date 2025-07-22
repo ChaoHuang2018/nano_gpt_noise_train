@@ -42,10 +42,10 @@ error_layer_types = "MLP,CausalSelfAttention,LayerNorm,none"
 run_name = "default"
 
 # 以下是NPU需要
-# import torch_npu 
-# from torch_npu.contrib import transfer_to_npu
-# os.environ['ASCEND_LAUNCH_BLOCKING'] = '1'
-# os.environ['OMP_NUM_THREADS'] = '1'
+import torch_npu 
+from torch_npu.contrib import transfer_to_npu
+os.environ['ASCEND_LAUNCH_BLOCKING'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
 init_checkpoint_dir = "out-shakespeare-char/clean_init"
 
 # 用于保存数据
